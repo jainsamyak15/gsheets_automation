@@ -81,6 +81,7 @@ class PortfolioBot:
         user_data[user_id] = {'projects': []}
 
         await update.message.reply_text(
+            "Gm Gm \n\n"
             "Hi! I'm the Portfolio Collection Bot. Let's gather your information.\n\n"
             "Please enter your full name:"
         )
