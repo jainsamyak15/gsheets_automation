@@ -1,17 +1,29 @@
 import os
-from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+import logging
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
+from dotenv import load_dotenv
+from flask import Flask
+from threading import Thread
+
+# Set up logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
 
-# Get sensitive information from environment variables
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH")
+
+if not TELEGRAM_TOKEN or not GOOGLE_CREDENTIALS_PATH:
+    raise ValueError("Missing required environment variables. Please check your .env file.")
 
 # States for conversation handler
 NAME, CONTACT, INTRODUCTION, PROJECT_NAME, PROJECT_LINK, PROJECT_DOC, ANOTHER_PROJECT = range(7)
@@ -23,21 +35,25 @@ user_data = {}
 class PortfolioBot:
     def __init__(self, telegram_token, credentials_path):
         # Initialize Google Sheets credentials
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        credentials = ServiceAccountCredentials.from_json_keyfile_name(credentials_path, scope)
-        self.gc = gspread.authorize(credentials)
-
-        # Open the spreadsheet (create one if it doesn't exist)
         try:
-            self.sheet = self.gc.open("Portfolio Submissions").sheet1
-        except gspread.exceptions.SpreadsheetNotFound:
-            spreadsheet = self.gc.create("Portfolio Submissions")
-            self.sheet = spreadsheet.sheet1
-            spreadsheet.share(credentials.service_account_email, perm_type='user', role='writer')
-            print(f"Spreadsheet created: {spreadsheet.url}")
-            # Add headers
-            headers = ["Timestamp", "Name", "Contact", "Introduction", "Projects"]
-            self.sheet.append_row(headers)
+            scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+            credentials = ServiceAccountCredentials.from_json_keyfile_name(credentials_path, scope)
+            self.gc = gspread.authorize(credentials)
+
+            # Open the spreadsheet (create one if it doesn't exist)
+            try:
+                self.sheet = self.gc.open("Portfolio Submissions").sheet1
+            except:
+                spreadsheet = self.gc.create("Portfolio Submissions")
+                self.sheet = spreadsheet.sheet1
+                logger.info(f"Spreadsheet created: {spreadsheet.url}")
+                # Add headers
+                headers = ["Timestamp", "Name", "Contact", "Introduction", "Project Name", "Project Link",
+                           "Project Doc"]
+                self.sheet.append_row(headers)
+        except Exception as e:
+            logger.error(f"Failed to initialize Google Sheets: {e}")
+            raise
 
         # Initialize bot application
         self.application = Application.builder().token(telegram_token).build()
@@ -52,9 +68,9 @@ class PortfolioBot:
                 PROJECT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_project_name)],
                 PROJECT_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_project_link)],
                 PROJECT_DOC: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_project_doc)],
-                ANOTHER_PROJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.ask_another_project)],
+                ANOTHER_PROJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.ask_another_project)]
             },
-            fallbacks=[CommandHandler('cancel', self.cancel)],
+            fallbacks=[CommandHandler('cancel', self.cancel)]
         )
 
         self.application.add_handler(conv_handler)
@@ -71,15 +87,15 @@ class PortfolioBot:
         return NAME
 
     async def get_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Store name and ask for contact details."""
+        """Save user's name and ask for contact information."""
         user_id = update.message.from_user.id
         user_data[user_id]['name'] = update.message.text
 
-        await update.message.reply_text("Great! Now please share your contact details (email/phone):")
+        await update.message.reply_text("Please enter your contact information (email or phone number):")
         return CONTACT
 
     async def get_contact(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Store contact and ask for introduction."""
+        """Save user's contact information and ask for an introduction."""
         user_id = update.message.from_user.id
         user_data[user_id]['contact'] = update.message.text
 
@@ -87,96 +103,113 @@ class PortfolioBot:
         return INTRODUCTION
 
     async def get_introduction(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Store introduction and ask for project name."""
+        """Save user's introduction and ask for their project name."""
         user_id = update.message.from_user.id
         user_data[user_id]['introduction'] = update.message.text
 
-        await update.message.reply_text("Now, let's add your projects. What's the name of your project?")
+        await update.message.reply_text("Please enter the name of your project:")
         return PROJECT_NAME
 
     async def get_project_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Store project name and ask for project link."""
+        """Save project name and ask for project link."""
         user_id = update.message.from_user.id
-        user_data[user_id]['current_project'] = {'name': update.message.text}
+        project = {'name': update.message.text}
+        user_data[user_id]['projects'].append(project)
 
-        await update.message.reply_text("Please provide the link to your project:")
+        await update.message.reply_text("Please enter the link to your project:")
         return PROJECT_LINK
 
     async def get_project_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Store project link and ask for documentation."""
+        """Save project link and ask for project documentation."""
         user_id = update.message.from_user.id
-        user_data[user_id]['current_project']['link'] = update.message.text
+        project = user_data[user_id]['projects'][-1]
+        project['link'] = update.message.text
 
-        await update.message.reply_text("Please provide documentation or description for this project:")
+        await update.message.reply_text("Please provide documentation or a description of your project:")
         return PROJECT_DOC
 
     async def get_project_doc(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Store project documentation and ask if user wants to add another project."""
+        """Save project documentation and ask if the user has another project."""
         user_id = update.message.from_user.id
-        user_data[user_id]['current_project']['documentation'] = update.message.text
+        project = user_data[user_id]['projects'][-1]
+        project['doc'] = update.message.text
 
-        user_data[user_id]['projects'].append(user_data[user_id]['current_project'])
-
-        reply_keyboard = [['Yes', 'No']]
-        await update.message.reply_text(
-            "Would you like to add another project?",
-            reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True),
-        )
+        await update.message.reply_text("Would you like to add another project? (yes/no)")
         return ANOTHER_PROJECT
 
     async def ask_another_project(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Handle response about adding another project."""
-        if update.message.text.lower() == 'yes':
-            await update.message.reply_text(
-                "What's the name of your next project?",
-                reply_markup=ReplyKeyboardRemove(),
-            )
+        user_id = update.message.from_user.id
+        response = update.message.text.lower()
+
+        if response == 'yes':
+            await update.message.reply_text("Please enter the name of your next project:")
             return PROJECT_NAME
         else:
-            user_id = update.message.from_user.id
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            projects_formatted = "\n".join(
-                [
-                    f"Project: {p['name']}\nLink: {p['link']}\nDoc: {p['documentation']}\n"
-                    for p in user_data[user_id]['projects']
-                ]
-            )
-
-            row_data = [
-                timestamp,
-                user_data[user_id]['name'],
-                user_data[user_id]['contact'],
-                user_data[user_id]['introduction'],
-                projects_formatted,
-            ]
-
-            self.sheet.append_row(row_data)
-            del user_data[user_id]
-
-            await update.message.reply_text(
-                "Thank you! Your portfolio information has been saved.",
-                reply_markup=ReplyKeyboardRemove(),
-            )
+            await self.save_to_sheet(user_id)
+            await update.message.reply_text("Thank you! Your information has been saved.")
+            user_data.pop(user_id, None)
             return ConversationHandler.END
+
+    async def save_to_sheet(self, user_id):
+        """Save user data to Google Sheets."""
+        data = user_data[user_id]
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        for project in data['projects']:
+            row = [
+                timestamp,
+                data['name'],
+                data['contact'],
+                data['introduction'],
+                project['name'],
+                project['link'],
+                project['doc']
+            ]
+            self.sheet.append_row(row)
 
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Cancel the conversation."""
         user_id = update.message.from_user.id
-        if user_id in user_data:
-            del user_data[user_id]
-
-        await update.message.reply_text(
-            "Operation cancelled. Your data was not saved.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+        user_data.pop(user_id, None)
+        await update.message.reply_text("The process has been canceled. Have a great day!")
         return ConversationHandler.END
 
     def run(self):
-        """Run the bot."""
-        self.application.run_polling()
+        """Run the bot and Flask server in separate threads."""
+        try:
+            # Start the Flask app in a separate thread
+            flask_thread = Thread(target=self.run_flask)
+            flask_thread.daemon = True
+            flask_thread.start()
+
+            # Start the Telegram bot in the main thread
+            logger.info("Starting bot...")
+            self.application.run_polling(drop_pending_updates=True)
+        except Exception as e:
+            logger.error(f"Failed to start the bot: {e}")
+            raise
+
+    def run_flask(self):
+        """Run a simple Flask app for port binding."""
+        try:
+            app = Flask(__name__)
+
+            @app.route('/')
+            def hello():
+                return "Hello, I'm the Portfolio Bot!"
+
+            port = int(os.getenv('PORT', 10000))
+            app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+        except Exception as e:
+            logger.error(f"Failed to start Flask server: {e}")
+            raise
 
 
 if __name__ == "__main__":
-    bot = PortfolioBot(TELEGRAM_TOKEN, GOOGLE_CREDENTIALS_PATH)
-    bot.run()
+    try:
+        bot = PortfolioBot(TELEGRAM_TOKEN, GOOGLE_CREDENTIALS_PATH)
+        bot.run()
+    except Exception as e:
+        logger.error(f"Failed to initialize or run the bot: {e}")
+        raise
