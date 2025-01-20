@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import gspread
@@ -9,7 +10,7 @@ from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
 
-# Set up logging
+# Set up logging with more detailed format
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -19,8 +20,11 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
+# Environment variables
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH")
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+RETRY_DELAY = int(os.getenv("RETRY_DELAY", "10"))
 
 if not TELEGRAM_TOKEN or not GOOGLE_CREDENTIALS_PATH:
     raise ValueError("Missing required environment variables. Please check your .env file.")
@@ -34,29 +38,44 @@ user_data = {}
 
 class PortfolioBot:
     def __init__(self, telegram_token, credentials_path):
-        # Initialize Google Sheets credentials
-        try:
-            scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-            credentials = ServiceAccountCredentials.from_json_keyfile_name(credentials_path, scope)
-            self.gc = gspread.authorize(credentials)
+        self.telegram_token = telegram_token
+        self.credentials_path = credentials_path
+        self.initialize_google_sheets()
+        self.initialize_bot()
+        logger.info("Bot initialized successfully")
 
-            # Open the spreadsheet (create one if it doesn't exist)
+    def initialize_google_sheets(self):
+        """Initialize Google Sheets with retry mechanism"""
+        retry_count = 0
+        while retry_count < MAX_RETRIES:
             try:
-                self.sheet = self.gc.open("Portfolio Submissions").sheet1
-            except:
-                spreadsheet = self.gc.create("Portfolio Submissions")
-                self.sheet = spreadsheet.sheet1
-                logger.info(f"Spreadsheet created: {spreadsheet.url}")
-                # Add headers
-                headers = ["Timestamp", "Name", "Contact", "Introduction", "Project Name", "Project Link",
-                           "Project Doc"]
-                self.sheet.append_row(headers)
-        except Exception as e:
-            logger.error(f"Failed to initialize Google Sheets: {e}")
-            raise
+                scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+                credentials = ServiceAccountCredentials.from_json_keyfile_name(self.credentials_path, scope)
+                self.gc = gspread.authorize(credentials)
 
-        # Initialize bot application
-        self.application = Application.builder().token(telegram_token).build()
+                try:
+                    self.sheet = self.gc.open("Portfolio Submissions").sheet1
+                except:
+                    spreadsheet = self.gc.create("Portfolio Submissions")
+                    self.sheet = spreadsheet.sheet1
+                    logger.info(f"Spreadsheet created: {spreadsheet.url}")
+                    headers = ["Timestamp", "Name", "Contact", "Introduction", "Project Name", "Project Link",
+                               "Project Doc"]
+                    self.sheet.append_row(headers)
+
+                logger.info("Google Sheets connection established successfully")
+                return
+            except Exception as e:
+                retry_count += 1
+                logger.error(f"Attempt {retry_count} failed to initialize Google Sheets: {e}", exc_info=True)
+                if retry_count < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY)
+                else:
+                    raise
+
+    def initialize_bot(self):
+        """Initialize the Telegram bot application"""
+        self.application = Application.builder().token(self.telegram_token).build()
 
         # Add conversation handler
         conv_handler = ConversationHandler(
@@ -74,6 +93,7 @@ class PortfolioBot:
         )
 
         self.application.add_handler(conv_handler)
+        logger.info("Bot handlers initialized successfully")
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Start the conversation and ask for user's name."""
@@ -147,27 +167,44 @@ class PortfolioBot:
             await update.message.reply_text("Please enter the name of your next project:")
             return PROJECT_NAME
         else:
-            await self.save_to_sheet(user_id)
-            await update.message.reply_text("Thank you! Your information has been saved.")
-            user_data.pop(user_id, None)
+            try:
+                await self.save_to_sheet(user_id)
+                await update.message.reply_text("Thank you! Your information has been saved.")
+            except Exception as e:
+                logger.error(f"Failed to save data: {e}", exc_info=True)
+                await update.message.reply_text("There was an error saving your information. Please try again later.")
+            finally:
+                user_data.pop(user_id, None)
             return ConversationHandler.END
 
     async def save_to_sheet(self, user_id):
-        """Save user data to Google Sheets."""
-        data = user_data[user_id]
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        """Save user data to Google Sheets with retry mechanism."""
+        retry_count = 0
+        while retry_count < MAX_RETRIES:
+            try:
+                data = user_data[user_id]
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        for project in data['projects']:
-            row = [
-                timestamp,
-                data['name'],
-                data['contact'],
-                data['introduction'],
-                project['name'],
-                project['link'],
-                project['doc']
-            ]
-            self.sheet.append_row(row)
+                for project in data['projects']:
+                    row = [
+                        timestamp,
+                        data['name'],
+                        data['contact'],
+                        data['introduction'],
+                        project['name'],
+                        project['link'],
+                        project['doc']
+                    ]
+                    self.sheet.append_row(row)
+                logger.info(f"Successfully saved data for user {user_id}")
+                return
+            except Exception as e:
+                retry_count += 1
+                logger.error(f"Attempt {retry_count} failed to save to sheet: {e}", exc_info=True)
+                if retry_count < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY)
+                else:
+                    raise
 
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Cancel the conversation."""
@@ -176,23 +213,8 @@ class PortfolioBot:
         await update.message.reply_text("The process has been canceled. Have a great day!")
         return ConversationHandler.END
 
-    def run(self):
-        """Run the bot and Flask server in separate threads."""
-        try:
-            # Start the Flask app in a separate thread
-            flask_thread = Thread(target=self.run_flask)
-            flask_thread.daemon = True
-            flask_thread.start()
-
-            # Start the Telegram bot in the main thread
-            logger.info("Starting bot...")
-            self.application.run_polling(drop_pending_updates=True)
-        except Exception as e:
-            logger.error(f"Failed to start the bot: {e}")
-            raise
-
     def run_flask(self):
-        """Run a simple Flask app for port binding."""
+        """Run a simple Flask app for port binding with health check."""
         try:
             app = Flask(__name__)
 
@@ -200,17 +222,60 @@ class PortfolioBot:
             def hello():
                 return "Hello, I'm the Portfolio Bot!"
 
+            @app.route('/health')
+            def health():
+                # Add basic health checks
+                try:
+                    # Check Google Sheets connection
+                    self.sheet.row_count
+                    return "OK", 200
+                except Exception as e:
+                    logger.error(f"Health check failed: {e}", exc_info=True)
+                    return "Service Unavailable", 503
+
             port = int(os.getenv('PORT', 10000))
+            logger.info(f"Starting Flask server on port {port}")
             app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
         except Exception as e:
-            logger.error(f"Failed to start Flask server: {e}")
+            logger.error(f"Failed to start Flask server: {e}", exc_info=True)
+            raise
+
+    def run(self):
+        """Run the bot and Flask server with improved error handling and recovery."""
+        try:
+            # Start the Flask app in a separate thread
+            flask_thread = Thread(target=self.run_flask)
+            flask_thread.daemon = True
+            flask_thread.start()
+            logger.info("Flask thread started")
+
+            # Run the bot with automatic reconnection
+            while True:
+                try:
+                    logger.info("Starting bot polling...")
+                    self.application.run_polling(drop_pending_updates=True)
+                except Exception as e:
+                    logger.error(f"Bot polling stopped: {e}", exc_info=True)
+                    logger.info(f"Attempting to restart in {RETRY_DELAY} seconds...")
+                    time.sleep(RETRY_DELAY)
+        except Exception as e:
+            logger.error(f"Critical error in main loop: {e}", exc_info=True)
             raise
 
 
 if __name__ == "__main__":
-    try:
-        bot = PortfolioBot(TELEGRAM_TOKEN, GOOGLE_CREDENTIALS_PATH)
-        bot.run()
-    except Exception as e:
-        logger.error(f"Failed to initialize or run the bot: {e}")
-        raise
+    retry_count = 0
+    while retry_count < MAX_RETRIES:
+        try:
+            logger.info("Initializing Portfolio Bot...")
+            bot = PortfolioBot(TELEGRAM_TOKEN, GOOGLE_CREDENTIALS_PATH)
+            bot.run()
+        except Exception as e:
+            retry_count += 1
+            logger.error(f"Attempt {retry_count} failed to start bot: {e}", exc_info=True)
+            if retry_count < MAX_RETRIES:
+                logger.info(f"Retrying in {RETRY_DELAY} seconds...")
+                time.sleep(RETRY_DELAY)
+            else:
+                logger.error("Max retries reached. Shutting down.")
+                raise
