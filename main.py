@@ -1,6 +1,7 @@
 import os
 import logging
 import time
+import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import gspread
@@ -241,7 +242,7 @@ class PortfolioBot:
             raise
 
     def run(self):
-        """Run the bot and Flask server with improved error handling and recovery."""
+        """Run the bot and Flask server with improved error handling and event loop management."""
         try:
             # Start the Flask app in a separate thread
             flask_thread = Thread(target=self.run_flask)
@@ -253,11 +254,53 @@ class PortfolioBot:
             while True:
                 try:
                     logger.info("Starting bot polling...")
+                    # Create a new event loop for each attempt
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                    # Reinitialize the application for each attempt
+                    self.application = Application.builder().token(self.telegram_token).build()
+
+                    # Re-add the conversation handler
+                    conv_handler = ConversationHandler(
+                        entry_points=[CommandHandler('start', self.start)],
+                        states={
+                            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_name)],
+                            CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_contact)],
+                            INTRODUCTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_introduction)],
+                            PROJECT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_project_name)],
+                            PROJECT_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_project_link)],
+                            PROJECT_DOC: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_project_doc)],
+                            ANOTHER_PROJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.ask_another_project)]
+                        },
+                        fallbacks=[CommandHandler('cancel', self.cancel)]
+                    )
+                    self.application.add_handler(conv_handler)
+
+                    # Run the application with the new event loop
                     self.application.run_polling(drop_pending_updates=True)
+
                 except Exception as e:
                     logger.error(f"Bot polling stopped: {e}", exc_info=True)
                     logger.info(f"Attempting to restart in {RETRY_DELAY} seconds...")
+
+                    # Clean up the event loop
+                    try:
+                        loop.stop()
+                        loop.close()
+                    except Exception as loop_error:
+                        logger.error(f"Error closing event loop: {loop_error}", exc_info=True)
+
                     time.sleep(RETRY_DELAY)
+
+                finally:
+                    # Ensure the event loop is closed
+                    try:
+                        if loop and not loop.is_closed():
+                            loop.close()
+                    except Exception as cleanup_error:
+                        logger.error(f"Error in final cleanup: {cleanup_error}", exc_info=True)
+
         except Exception as e:
             logger.error(f"Critical error in main loop: {e}", exc_info=True)
             raise
